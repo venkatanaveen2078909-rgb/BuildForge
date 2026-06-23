@@ -1,0 +1,6 @@
+{
+  "name": "BuildForge",
+  "description": "A distributed incremental build system featuring a hand-written BUILD parser, topological dependency scheduler, and worker coordination dashboard.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

@@ -1,0 +1,42 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600;700&display=swap');
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+
+  /* Specialist Theme Hex Colors */
+  --color-technical-bg: #0A0B0D;
+  --color-darker: #050506;
+  --color-sidebar-bg: #0D0E11;
+  --color-dim: #88888E;
+  
+  /* Status Colors */
+  --color-status-green: #4ADE80;
+  --color-status-blue: #60A5FA;
+  --color-status-amber: #FBBF24;
+  
+  /* Technical Border Utility with opacity */
+  --color-technical-border: rgba(255, 255, 255, 0.08);
+}
+
+.grid-pattern {
+  background-image: radial-gradient(circle, rgba(255, 255, 255, 0.03) 1px, transparent 1px);
+  background-size: 24px 24px;
+}
+
+/* Scrollbar customization for technical aesthetic */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: #050506;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.1);
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.2);
+}
