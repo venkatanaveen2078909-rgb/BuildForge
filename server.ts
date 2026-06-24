@@ -34,8 +34,8 @@ app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', serverTime: new Date().toISOString() });
 });
 
-// 2. Parser endpoint for realtime validation
-app.post('/api/parse-build', (req, res) => {
+// 2. Parser and Build Trigger endpoint
+app.post('/api/build', async (req, res) => {
   const { code } = req.body;
   if (typeof code !== 'string') {
     res.status(400).json({ error: 'Missing or invalid code body' });
@@ -48,13 +48,132 @@ app.post('/api/parse-build', (req, res) => {
     const parser = new TsParser(tokens);
     const result = parser.parse();
 
+    if (result.diagnostics.length > 0 && result.diagnostics.some(d => d.severity === 'Error')) {
+      res.status(400).json({ error: 'Syntax errors in BUILD file', diagnostics: result.diagnostics });
+      return;
+    }
+
+    // Convert rules to Targets
+    const targets: any[] = result.rules.map((r: any) => {
+      const name = `//:${r.name || 'unnamed'}`;
+      const srcs: string[] = [];
+      if (r.args.srcs && r.args.srcs.type === 'ListExpr') {
+         r.args.srcs.elements.forEach((e: any) => srcs.push(e.value));
+      }
+      const deps: string[] = [];
+      if (r.args.deps && r.args.deps.type === 'ListExpr') {
+         r.args.deps.elements.forEach((e: any) => {
+            const cleanDep = e.value.startsWith(':') ? `//:${e.value.slice(1)}` : e.value;
+            deps.push(cleanDep);
+         });
+      }
+      return { name, ruleType: r.ruleType, srcs, deps };
+    });
+
+    // Compute independent batches using Kahn's algorithm
+    const adj: Record<string, string[]> = {};
+    const inDegree: Record<string, number> = {};
+    const allNodesSet = new Set<string>();
+
+    targets.forEach(t => {
+      allNodesSet.add(t.name);
+      if (!adj[t.name]) adj[t.name] = [];
+      if (!(t.name in inDegree)) inDegree[t.name] = 0;
+
+      t.deps.forEach((dep: string) => {
+        allNodesSet.add(dep);
+        if (!adj[dep]) adj[dep] = [];
+        adj[dep].push(t.name);
+        inDegree[t.name] = (inDegree[t.name] || 0) + 1;
+        if (!(dep in inDegree)) inDegree[dep] = 0;
+      });
+    });
+
+    const allNodes = Array.from(allNodesSet).sort();
+    const tempInDegree = { ...inDegree };
+    const batches: string[][] = [];
+    let currentBatch: string[] = [];
+
+    allNodes.forEach(n => {
+      if (tempInDegree[n] === 0) currentBatch.push(n);
+    });
+    currentBatch.sort();
+
+    while (currentBatch.length > 0) {
+      batches.push(currentBatch);
+      const nextBatch: string[] = [];
+      currentBatch.forEach(u => {
+        const neighbors = adj[u] || [];
+        neighbors.forEach(v => {
+          tempInDegree[v]--;
+          if (tempInDegree[v] === 0) {
+            nextBatch.push(v);
+          }
+        });
+      });
+      nextBatch.sort();
+      currentBatch = nextBatch;
+    }
+
+    // Insert into DB
+    const { query } = await import('./src/db/index');
+    const sessionId = 'b-' + Math.floor(Math.random() * 9000 + 1000);
+    const traceId = 'bf-' + Math.floor(Math.random() * 10000) + '-4b69-' + Math.floor(Math.random() * 10000);
+    
+    await query(
+      `INSERT INTO build_sessions (id, status, trace_id, total_targets, start_time) VALUES ($1, $2, $3, $4, NOW())`,
+      [sessionId, 'RUNNING', traceId, targets.length]
+    );
+
+    for (const target of targets) {
+      await query(
+        `INSERT INTO build_targets (name, session_id, status, cache_key) VALUES ($1, $2, $3, $4)`,
+        [target.name, sessionId, 'QUEUED', Math.floor(Math.random() * 1000000).toString(16)]
+      );
+    }
+
+    // Trigger async execution
+    const { executeBuild } = await import('./src/lib/executor');
+    executeBuild(sessionId, targets, batches);
+
     res.json({
-      tokens,
-      rules: result.rules,
-      diagnostics: result.diagnostics,
+      sessionId,
+      traceId,
+      status: 'RUNNING',
+      totalTargets: targets.length,
+      message: 'Build started in backend',
     });
   } catch (error: any) {
+    console.error(error);
     res.status(500).json({ error: error?.message || 'Parser internal failure' });
+  }
+});
+
+// 2b. Status endpoint for polling
+app.get('/api/build/:id', async (req, res) => {
+  const sessionId = req.params.id;
+  try {
+    const { query } = await import('./src/db/index');
+    const sessionRes = await query(`SELECT * FROM build_sessions WHERE id = $1`, [sessionId]);
+    if (sessionRes.rows.length === 0) {
+      res.status(404).json({ error: 'Build session not found' });
+      return;
+    }
+    const session = sessionRes.rows[0];
+    
+    const targetsRes = await query(`SELECT * FROM build_targets WHERE session_id = $1`, [sessionId]);
+    const workersRes = await query(`SELECT * FROM workers`);
+    const logsRes = await query(`SELECT * FROM target_logs WHERE session_id = $1 ORDER BY created_at ASC`, [sessionId]);
+
+    res.json({
+      session,
+      targets: targetsRes.rows,
+      workers: workersRes.rows,
+      logs: logsRes.rows
+    });
+  } catch (error: any) {
+    console.error(error);
+    res.status(500).json({ error: 'Failed to fetch build status' });
   }
 });
 

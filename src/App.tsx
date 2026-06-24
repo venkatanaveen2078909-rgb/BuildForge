@@ -352,7 +352,7 @@ export default function App() {
   };
 
   // Submit and start parallel build simulation
-  const startBuildSimulation = (bypassCache = false) => {
+  const startBuildSimulation = async (bypassCache = false) => {
     if (cyclePath) {
       addLog('Cannot build target graph: A circular dependency loop exists!', 'error');
       return;
@@ -362,185 +362,110 @@ export default function App() {
       return;
     }
 
-    // Clean up older interval
     if (simIntervalRef.current) clearInterval(simIntervalRef.current);
 
-    const generatedUuid = 'bf-' + Math.floor(Math.random() * 10000) + '-4b69-' + Math.floor(Math.random() * 10000) + '-d232a5bf' + Math.floor(Math.random() * 9999);
-    setTraceId(generatedUuid);
-
-    const initialSession: BuildSession = {
-      buildId: 'b-' + Math.floor(Math.random() * 9000 + 1000),
-      status: 'RUNNING',
-      traceId: generatedUuid,
-      totalTargets: buildTargets.length,
-      completedTargets: 0,
-      targets: {},
-      startTime: new Date().toISOString()
-    };
-
-    buildTargets.forEach(t => {
-      initialSession.targets[t.name] = {
-        name: t.name,
-        status: 'QUEUED',
-        logs: [],
-        cacheKey: Math.floor(Math.random() * 1000000).toString(16)
+    try {
+      const response = await fetch('/api/build', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ code })
+      });
+      if (!response.ok) {
+        addLog('Failed to start build on backend', 'error');
+        return;
+      }
+      const data = await response.json();
+      setTraceId(data.traceId);
+      
+      const initialSession: BuildSession = {
+        buildId: data.sessionId,
+        status: 'RUNNING',
+        traceId: data.traceId,
+        totalTargets: data.totalTargets,
+        completedTargets: 0,
+        targets: {},
+        startTime: new Date().toISOString()
       };
-    });
+      
+      setActiveBuild(initialSession);
+      buildStateRef.current = initialSession;
+      setLogs([]);
+      addLog(`Coordinator Initialized with trace ID: ${data.traceId}`, 'info');
 
-    setActiveBuild(initialSession);
-    buildStateRef.current = initialSession;
-
-    setLogs([]);
-    addLog(`Coordinator Initialized with trace ID: ${generatedUuid}`, 'info');
-    addLog(`Build Session ${initialSession.buildId} created. Resolving ${initialSession.totalTargets} nodes.`, 'info');
-
-    // Run active heartbeat timer and work loop
-    runSchedulerStep(bypassCache);
+      runSchedulerStep(data.sessionId);
+    } catch (e) {
+      addLog('Error connecting to backend', 'error');
+    }
   };
 
-  // Unified logger helper
   const addLog = (msg: string, type: 'info' | 'success' | 'warn' | 'error' | 'steal' = 'info') => {
     setLogs(prev => [...prev, { id: Math.random().toString(), msg, type }]);
   };
 
-  // Stepping the Work-Stealing scheduler simulator
-  const runSchedulerStep = (bypassCache: boolean) => {
-    let currentBatchIndex = 0;
-    let inProgress: Set<string> = new Set();
-    let completed: Set<string> = new Set();
-
-    setWorkers(prev => prev.map(w => ({ ...w, status: 'IDLE', activeTaskId: undefined })));
-
-    simIntervalRef.current = setInterval(() => {
-      const state = buildStateRef.current;
-      if (!state) return;
-
-      // 1. If all completed, finish build gracefully
-      if (completed.size === state.totalTargets) {
-        clearInterval(simIntervalRef.current!);
-        const finishedBuild: BuildSession = { ...state, status: 'SUCCEEDED', endTime: new Date().toISOString() };
-        setActiveBuild(finishedBuild);
-        setHistoryBuilds(prev => [finishedBuild, ...prev]);
-        addLog(`[Coordinator] buildforge trace successfully completed! Final metrics cached.`, 'success');
-        setWorkers(prev => prev.map(w => ({ ...w, status: 'IDLE', activeTaskId: undefined, cpuUsage: 1 })));
-        setMetrics(prev => ({
-          ...prev,
-          totalBuilds: prev.totalBuilds + 1,
-          successfulBuilds: prev.successfulBuilds + 1
-        }));
-        return;
-      }
-
-      // 2. Schedule current batched layer
-      const batch = topoBatches[currentBatchIndex];
-      if (!batch) return;
-
-      // Filter eligible batch targets that haven't built yet
-      const eligibleTargets = batch.filter(t => !completed.has(t) && !inProgress.has(t));
-
-      if (eligibleTargets.length === 0 && inProgress.size === 0) {
-        currentBatchIndex++;
-        return;
-      }
-
-      // Assign targets to workers simulating CPU strands or work-stealing
-      setWorkers(prevWorkers => {
-        let updatedWorkers = [...prevWorkers];
-        let hasAssignments = false;
-
-        // Distribute tasks across workers
-        eligibleTargets.forEach((targetName, targetIndex) => {
-          const targetConfig = buildTargets.find(t => t.name === targetName);
-          const targetMeta = state.targets[targetName];
-          if (!targetConfig || !targetMeta) return;
-
-          // Find lowest-load worker (idle or lower active)
-          const workerIndex = targetIndex % updatedWorkers.length;
-          const assignedWorker = updatedWorkers[workerIndex];
-
-          if (assignedWorker && assignedWorker.status !== 'DEAD') {
-            inProgress.add(targetName);
-            hasAssignments = true;
-
-            // Simple micro hash collision chance: cache hit vs compile
-            const rand = Math.random();
-            const cacheHit = !bypassCache && rand > 0.4; // 60% chance to leverage cache keys
-
-            if (cacheHit) {
-              completed.add(targetName);
-              inProgress.delete(targetName);
-
-              assignedWorker.status = 'FETCHING_INPUTS';
-              assignedWorker.activeTaskId = targetName;
-              assignedWorker.cpuUsage = 4;
-
-              setTimeout(() => {
-                assignedWorker.status = 'IDLE';
-                assignedWorker.activeTaskId = undefined;
-              }, 400);
-
-              addLog(`[Cache-Hit] Target ${targetName} matches manifest hash. Storing local symlinks.`, 'success');
-              setMetrics(m => ({
-                ...m,
-                cacheHits: m.cacheHits + 1,
-                timeSavedMs: m.timeSavedMs + 5000,
-                bytesSaved: m.bytesSaved + 48020
-              }));
-
-              // Update target state
-              state.targets[targetName].status = 'CACHED';
-              const nextCachedState = { ...state, completedTargets: completed.size };
-              setActiveBuild(nextCachedState);
-              buildStateRef.current = nextCachedState;
-            } else {
-              // Real simulation run
-              assignedWorker.status = 'EXECUTING';
-              assignedWorker.activeTaskId = targetName;
-              assignedWorker.cpuUsage = Math.floor(Math.random() * 50) + 40;
-              assignedWorker.memoryUsage = Math.floor(Math.random() * 100) + 120;
-              
-              state.targets[targetName].status = 'RUNNING';
-              addLog(`[Worker ${assignedWorker.id}] EXECUTING compile action for ${targetName} under c++23 standard.`, 'info');
-
-              // Steal chance simulation
-              const stealChance = Math.random() > 0.7;
-              if (stealChance && updatedWorkers.length > 1) {
-                const victimIndex = (workerIndex + 1) % updatedWorkers.length;
-                const victimWorker = updatedWorkers[victimIndex];
-                if (victimWorker && victimWorker.id !== assignedWorker.id) {
-                  addLog(`[Work-Stealing] Thread-Stealer popped target ${targetName} from worker queue head in thread context [${assignedWorker.id}]`, 'steal');
-                }
-              }
-
-              // Async complete simulating standard compilation duration
-              setTimeout(() => {
-                completed.add(targetName);
-                inProgress.delete(targetName);
-                assignedWorker.status = 'UPLOADING_ARTIFACTS';
-                addLog(`[Worker] Build completed for ${targetName}. Packaging compressed zstd output.`, 'info');
-
-                setTimeout(() => {
-                  assignedWorker.status = 'IDLE';
-                  assignedWorker.activeTaskId = undefined;
-                  assignedWorker.cpuUsage = 2;
-                }, 300);
-
-                // Update target build stats
-                state.targets[targetName].status = 'SUCCEEDED';
-                state.targets[targetName].durationMs = Math.floor(Math.random() * 2000 + 1000);
-                setMetrics(m => ({ ...m, cacheMisses: m.cacheMisses + 1 }));
-                const nextSucceededState = { ...state, completedTargets: completed.size };
-                setActiveBuild(nextSucceededState);
-                buildStateRef.current = nextSucceededState;
-              }, 1200);
-            }
-          }
+  const runSchedulerStep = (sessionId: string) => {
+    simIntervalRef.current = setInterval(async () => {
+      try {
+        const response = await fetch(`/api/build/${sessionId}`);
+        if (!response.ok) return;
+        const data = await response.json();
+        
+        const targetsRecord: Record<string, any> = {};
+        data.targets.forEach((t: any) => {
+          targetsRecord[t.name] = {
+            name: t.name,
+            status: t.status,
+            workerId: t.worker_id,
+            durationMs: t.duration_ms,
+            cacheKey: t.cache_key,
+            logs: []
+          };
         });
+        
+        const newSession = {
+          buildId: data.session.id,
+          status: data.session.status,
+          traceId: data.session.trace_id,
+          totalTargets: data.session.total_targets,
+          completedTargets: data.session.completed_targets,
+          targets: targetsRecord,
+          startTime: data.session.start_time,
+          endTime: data.session.end_time
+        };
+        
+        setActiveBuild(newSession);
+        buildStateRef.current = newSession;
+        
+        setWorkers(data.workers.map((w: any) => ({
+          id: w.id,
+          status: w.status,
+          capacity: w.capacity,
+          activeTaskId: w.active_task_id,
+          lastHeartbeat: w.last_heartbeat,
+          cpuUsage: w.cpu_usage,
+          memoryUsage: w.memory_usage,
+          tags: w.tags ? w.tags.split(',') : [],
+          localQueue: []
+        })));
+        
+        if (data.logs && data.logs.length > 0) {
+          const newLogs = data.logs.map((l: any) => ({
+             id: l.id.toString(),
+             msg: `[Backend] ${l.log}`,
+             type: 'info'
+          }));
+          setLogs(newLogs);
+        }
 
-        return updatedWorkers;
-      });
+        if (data.session.status === 'SUCCEEDED' || data.session.status === 'FAILED') {
+           clearInterval(simIntervalRef.current!);
+           addLog(`[Coordinator] buildforge trace finished with status: ${data.session.status}`, data.session.status === 'SUCCEEDED' ? 'success' : 'error');
+           setHistoryBuilds(prev => [newSession, ...prev]);
+        }
 
-    }, simulationSpeed);
+      } catch (err) {
+        console.error(err);
+      }
+    }, 1000);
   };
 
   // Inject dead worker failure mid-execution
